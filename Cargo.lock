@@ -179,6 +179,7 @@ dependencies = [
  "libc",
  "polars",
  "rig-core",
+ "schemars",
  "serde",
  "serde_json",
  "serde_yaml",

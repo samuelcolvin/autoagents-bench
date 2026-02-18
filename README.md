@@ -21,7 +21,7 @@ The benchmarks are written in Rust and Python. The Rust benchmarks use the `auto
 ### Benchmark
 The below bencmark is run for 50 concurrent requests to process an ReAct Style Agent to process and parquet file to calculate the average duration time.
 
-![Benchmark](./plots/benchmark_grid_tools_50.png)
+![Benchmark](./plots/benchmark_grid_tool.png)
 
 ---
 
@@ -30,7 +30,8 @@ The below bencmark is run for 50 concurrent requests to process an ReAct Style A
 ```shell
 export OPENAI_API_KEY=sk-your-key
 
-cargo run --release
+cargo run --release -- autoagents
+cargo run --release -- rig
 ```
 
 ### Python benchmark (GraphBit, LangChain, LangGraph, CrewAI, PydanticAI, LlamaIndex)
@@ -39,7 +40,7 @@ cargo run --release
 export OPENAI_API_KEY=sk-your-key
 
 # Using uv (recommended) or your preferred Python runner
-uv run main.py
+uv run main.py pydantic --model tool
 
 cargo run --release -- all
 ```
@@ -50,6 +51,9 @@ cargo run --release -- all
 uv run python plot_benchmarks.py --input benchmark_results_tool.json
 uv run python plot_benchmarks.py --input benchmark_results_llm.json
 ```
+
+### Web Dashboard
+For web based UI to look into, check out `benchmark-dashboard`.
 
 ### Note
 

@@ -5,9 +5,12 @@ use autoagents::async_trait;
 use autoagents::core::agent::memory::{MemoryProvider, SlidingWindowMemory};
 use autoagents::core::agent::prebuilt::executor::{ReActAgent, ReActAgentOutput};
 use autoagents::core::agent::task::Task;
-use autoagents::core::agent::{AgentBuilder, AgentOutputT, DirectAgent};
-use autoagents::core::tool::{ToolCallError, ToolInputT, ToolRuntime, ToolT};
+use autoagents::core::agent::{
+    AgentBuilder, AgentHooks, AgentOutputT, Context as AgentContext, DirectAgent,
+};
+use autoagents::core::tool::{ToolCallError, ToolCallResult, ToolInputT, ToolRuntime, ToolT};
 use autoagents::llm::LLMProvider;
+use autoagents::llm::ToolCall;
 use autoagents::llm::backends::openai::OpenAI;
 use autoagents::llm::builder::LLMBuilder;
 use autoagents::llm::chat::{
@@ -18,12 +21,11 @@ use autoagents::llm::completion::{CompletionProvider, CompletionRequest, Complet
 use autoagents::llm::embedding::EmbeddingProvider;
 use autoagents::llm::error::LLMError;
 use autoagents::llm::models::{ModelListRequest, ModelListResponse, ModelsProvider};
-use autoagents::protocol::{Event, SubmissionId};
-use autoagents_derive::{AgentHooks, AgentOutput, ToolInput, agent, tool};
+use autoagents_derive::{AgentOutput, ToolInput, agent, tool};
 use futures::stream::{FuturesUnordered, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::mem::MaybeUninit;
 use std::path::Path;
@@ -74,6 +76,11 @@ impl Drop for ToolTimingGuard {
 }
 
 static TOOL_TIMINGS: OnceLock<Mutex<Vec<Duration>>> = OnceLock::new();
+static TOOL_START_TIMES: OnceLock<Mutex<HashMap<usize, Instant>>> = OnceLock::new();
+
+fn tool_start_times() -> &'static Mutex<HashMap<usize, Instant>> {
+    TOOL_START_TIMES.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 tokio::task_local! {
     static REQUEST_ID: usize;
@@ -385,7 +392,6 @@ impl MemoryProvider for TaskLocalMemory {
 #[async_trait]
 impl ToolRuntime for TripDataProcessorTool {
     async fn execute(&self, _args: Value) -> Result<Value, ToolCallError> {
-        let _timing = ToolTimingGuard::start();
         let path =
             std::env::var("TRIP_DATA_PATH").unwrap_or_else(|_| "trip_data.parquet".to_string());
 
@@ -408,7 +414,7 @@ impl ToolRuntime for TripDataProcessorTool {
 }
 
 /// Math agent output with Value and Explanation
-#[derive(Debug, Serialize, Deserialize, AgentOutput)]
+#[derive(Debug, Serialize, Deserialize, AgentOutput, schemars::JsonSchema)]
 pub struct SimpleAgentOutput {
     #[output(description = "The Average Trip Duration")]
     value: f64,
@@ -552,8 +558,44 @@ impl From<ReActAgentOutput> for SimpleAgentOutput {
     tools = [TripDataProcessorTool],
     output = SimpleAgentOutput,
 )]
-#[derive(Default, Clone, AgentHooks)]
+#[derive(Default, Clone)]
 pub struct SimpleAgent {}
+
+#[async_trait]
+impl AgentHooks for SimpleAgent {
+    async fn on_tool_start(&self, _tool_call: &ToolCall, _ctx: &AgentContext) {
+        if let Ok(req_id) = REQUEST_ID.try_with(|id| *id) {
+            if let Ok(mut starts) = tool_start_times().lock() {
+                starts.insert(req_id, Instant::now());
+            }
+        }
+    }
+
+    async fn on_tool_result(
+        &self,
+        _tool_call: &ToolCall,
+        _result: &ToolCallResult,
+        _ctx: &AgentContext,
+    ) {
+        if let Ok(req_id) = REQUEST_ID.try_with(|id| *id) {
+            if let Ok(mut starts) = tool_start_times().lock() {
+                if let Some(start) = starts.remove(&req_id) {
+                    record_tool_timing(start.elapsed());
+                }
+            }
+        }
+    }
+
+    async fn on_tool_error(&self, _tool_call: &ToolCall, _err: Value, _ctx: &AgentContext) {
+        if let Ok(req_id) = REQUEST_ID.try_with(|id| *id) {
+            if let Ok(mut starts) = tool_start_times().lock() {
+                if let Some(start) = starts.remove(&req_id) {
+                    record_tool_timing(start.elapsed());
+                }
+            }
+        }
+    }
+}
 
 #[derive(Clone, Debug, Deserialize)]
 struct BenchmarkConfig {
@@ -753,15 +795,40 @@ async fn main() -> Result<()> {
 }
 
 async fn async_main() -> Result<()> {
-    // CLI: optional positional arg selects which framework to run.
+    // CLI argument parsing.
     // Usage:
-    //   cargo run                 -> run all (autoagents + rig)
-    //   cargo run -- autoagents   -> run only AutoAgents
-    //   cargo run -- rig          -> run only Rig
-    let framework = std::env::args()
-        .nth(1)
+    //   cargo run                          -> run all frameworks, both modes
+    //   cargo run -- autoagents            -> run only AutoAgents, both modes
+    //   cargo run -- rig                   -> run only Rig, both modes
+    //   cargo run -- all --mode tool       -> run all frameworks, tool mode only
+    //   cargo run -- autoagents --mode llm -> run AutoAgents, llm-only mode
+    //   cargo run -- rig --mode both       -> run Rig, both modes (explicit)
+    let args: Vec<String> = std::env::args().collect();
+
+    let framework = args
+        .get(1)
+        .cloned()
         .unwrap_or_else(|| "all".to_string())
         .to_lowercase();
+
+    // Parse optional --mode <tool|llm|both> flag anywhere after arg[1]
+    let mode_arg = args
+        .windows(2)
+        .find(|w| w[0] == "--mode")
+        .map(|w| w[1].to_lowercase());
+
+    let (run_llm, run_tool) = match mode_arg.as_deref() {
+        Some("tool") => (false, true),
+        Some("llm") => (true, false),
+        Some("both") | None => (true, true),
+        Some(other) => {
+            return Err(anyhow!(
+                "Unknown --mode '{}'. Valid options: tool, llm, both",
+                other
+            ));
+        }
+    };
+
     let run_autoagents = framework == "all" || framework == "autoagents";
     let run_rig = framework == "all" || framework == "rig";
 
@@ -793,35 +860,52 @@ async fn async_main() -> Result<()> {
     );
 
     if run_autoagents {
-        let autoagents_llm =
-            bench_autoagents(&config, expected_value, BenchmarkMode::LlmOnly).await?;
-        let mut autoagents_tool =
-            bench_autoagents(&config, expected_value, BenchmarkMode::Tool).await?;
-        apply_overhead_metrics(&mut autoagents_tool, &autoagents_llm);
-
         println!("\n=== AutoAgents Results ===");
-        autoagents_llm.print("llm");
-        persist_result(&autoagents_llm, "benchmark_results_llm.json")
-            .context("failed to persist autoagents llm results")?;
 
-        autoagents_tool.print("tool");
-        persist_result(&autoagents_tool, "benchmark_results_tool.json")
-            .context("failed to persist autoagents tool results")?;
+        let autoagents_llm = if run_llm {
+            let r = bench_autoagents(&config, expected_value, BenchmarkMode::LlmOnly).await?;
+            r.print("llm");
+            persist_result(&r, "benchmark_results_llm.json")
+                .context("failed to persist autoagents llm results")?;
+            Some(r)
+        } else {
+            None
+        };
+
+        if run_tool {
+            let mut autoagents_tool =
+                bench_autoagents(&config, expected_value, BenchmarkMode::Tool).await?;
+            if let Some(ref llm) = autoagents_llm {
+                apply_overhead_metrics(&mut autoagents_tool, llm);
+            }
+            autoagents_tool.print("tool");
+            persist_result(&autoagents_tool, "benchmark_results_tool.json")
+                .context("failed to persist autoagents tool results")?;
+        }
     }
 
     if run_rig {
-        let rig_llm = bench_rig(&config, expected_value, BenchmarkMode::LlmOnly).await?;
-        let mut rig_tool = bench_rig(&config, expected_value, BenchmarkMode::Tool).await?;
-        apply_overhead_metrics(&mut rig_tool, &rig_llm);
-
         println!("\n=== Rig Results ===");
-        rig_llm.print("llm");
-        persist_result(&rig_llm, "benchmark_results_llm.json")
-            .context("failed to persist rig llm results")?;
 
-        rig_tool.print("tool");
-        persist_result(&rig_tool, "benchmark_results_tool.json")
-            .context("failed to persist rig tool results")?;
+        let rig_llm = if run_llm {
+            let r = bench_rig(&config, expected_value, BenchmarkMode::LlmOnly).await?;
+            r.print("llm");
+            persist_result(&r, "benchmark_results_llm.json")
+                .context("failed to persist rig llm results")?;
+            Some(r)
+        } else {
+            None
+        };
+
+        if run_tool {
+            let mut rig_tool = bench_rig(&config, expected_value, BenchmarkMode::Tool).await?;
+            if let Some(ref llm) = rig_llm {
+                apply_overhead_metrics(&mut rig_tool, llm);
+            }
+            rig_tool.print("tool");
+            persist_result(&rig_tool, "benchmark_results_tool.json")
+                .context("failed to persist rig tool results")?;
+        }
     }
 
     Ok(())
@@ -846,8 +930,7 @@ async fn bench_autoagents(
 
     let mut llm_builder = LLMBuilder::<OpenAI>::new()
         .api_key(api_key)
-        .model(config.model.clone())
-        .temperature(0.2);
+        .model(config.model.clone());
     if matches!(mode, BenchmarkMode::Tool) {
         llm_builder = llm_builder.tool_choice(ToolChoice::Auto);
     }
@@ -862,46 +945,15 @@ async fn bench_autoagents(
     let request_timeout = request_timeout(config);
     let (breakdowns, elapsed, perf, setup_duration_s) = match mode {
         BenchmarkMode::Tool => {
-            let mut agent_handle =
-                AgentBuilder::<_, DirectAgent>::new(ReActAgent::new(SimpleAgent {}))
-                    .llm(timed_llm.clone())
-                    .memory(Box::new(TaskLocalMemory::default()))
-                    .build()
-                    .await?;
-            let mut event_stream = agent_handle.subscribe_events();
+            let agent_handle = AgentBuilder::<_, DirectAgent>::new(ReActAgent::new(SimpleAgent {}))
+                .llm(timed_llm.clone())
+                .memory(Box::new(TaskLocalMemory::default()))
+                .build()
+                .await?;
             let agent = Arc::new(agent_handle.agent);
             let setup_duration_s = setup_start.elapsed().as_secs_f64();
             reset_tool_timings();
             llm_timings.reset();
-            let event_results: Arc<TokioMutex<HashMap<SubmissionId, String>>> =
-                Arc::new(TokioMutex::new(HashMap::new()));
-            let event_tool_calls: Arc<TokioMutex<HashSet<SubmissionId>>> =
-                Arc::new(TokioMutex::new(HashSet::new()));
-            let results_store = event_results.clone();
-            let tools_store = event_tool_calls.clone();
-            tokio::spawn(async move {
-                while let Some(event) = event_stream.next().await {
-                    match event {
-                        Event::TaskComplete { sub_id, result, .. } => {
-                            let mut guard = results_store.lock().await;
-                            guard.insert(sub_id, result);
-                        }
-                        Event::TaskError { sub_id, error, .. } => {
-                            let mut guard = results_store.lock().await;
-                            guard.insert(sub_id, format!("TaskError: {error}"));
-                        }
-                        Event::ToolCallCompleted { sub_id, .. } => {
-                            let mut guard = tools_store.lock().await;
-                            guard.insert(sub_id);
-                        }
-                        Event::ToolCallFailed { sub_id, .. } => {
-                            let mut guard = tools_store.lock().await;
-                            guard.insert(sub_id);
-                        }
-                        _ => {}
-                    }
-                }
-            });
 
             let monitor =
                 PerformanceMonitor::start().context("failed to start performance monitor")?;
@@ -912,8 +964,6 @@ async fn bench_autoagents(
                 let permit = semaphore.clone();
                 let agent = Arc::clone(&agent);
                 let prompt = build_prompt(&config.prompt_template, req_id);
-                let event_results = event_results.clone();
-                let event_tool_calls = event_tool_calls.clone();
                 let request_memory: Arc<TokioMutex<Box<dyn MemoryProvider>>> =
                     Arc::new(TokioMutex::new(
                         Box::new(SlidingWindowMemory::new(10)) as Box<dyn MemoryProvider>
@@ -921,7 +971,6 @@ async fn bench_autoagents(
 
                 tasks.push(tokio::spawn(async move {
                     let task = Task::new(&prompt);
-                    let submission_id = task.submission_id;
                     let submitted = Instant::now();
                     let _permit = permit
                         .acquire_owned()
@@ -1451,7 +1500,12 @@ async fn bench_rig(
     // Validate the key is present before trying to use it.
     std::env::var("OPENAI_API_KEY")
         .context("OPENAI_API_KEY environment variable is required for Rig benchmark")?;
-    let openai = rig::providers::openai::Client::from_env();
+
+    // Use the Chat Completions API (CompletionsClient) rather than the default
+    // Responses API client. The Responses API client deserialises the
+    // `service_tier` field as a strict enum that doesn't include the
+    // `"priority"` variant OpenAI now returns, causing a JsonError at runtime.
+    let openai = rig::providers::openai::CompletionsClient::from_env();
 
     println!(
         "Preparing Rig benchmark ({:?}): {} requests with concurrency {}",
@@ -1468,10 +1522,10 @@ async fn bench_rig(
                 openai
                     .agent(&config.model)
                     .preamble(
-                        "You are a helpful assistant. Use tools when needed. \
-                         Respond with JSON {\"value\": <float>} only.",
+                         "You are a helpful assistant, provide the answer to the user's question in structured format"
                     )
                     .tool(RigTripTool)
+                    .output_schema::<SimpleAgentOutput>()
                     .build(),
             );
 

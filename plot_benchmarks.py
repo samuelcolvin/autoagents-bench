@@ -4,9 +4,9 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
 import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -77,7 +77,9 @@ def load_results(path: Path) -> pd.DataFrame:
     return frame
 
 
-def plot_metrics_grid(frame: pd.DataFrame, output_dir: Path, output_path: Path | None = None) -> None:
+def plot_metrics_grid(
+    frame: pd.DataFrame, output_dir: Path, output_path: Path | None = None
+) -> None:
     if "determinism_rate" in frame.columns:
         frame = frame.copy()
         frame["determinism_percent"] = frame["determinism_rate"] * 100.0
@@ -107,12 +109,12 @@ def plot_metrics_grid(frame: pd.DataFrame, output_dir: Path, output_path: Path |
             "title": "P95 Latency (Lower is Better)",
             "palette": "Purples_d",
         },
-        {
-            "column": "average_framework_overhead_ms",
-            "ylabel": "Overhead (ms)",
-            "title": "Framework Overhead (Lower is Better)",
-            "palette": "PuBuGn",
-        },
+        # {
+        #     "column": "average_framework_overhead_ms",
+        #     "ylabel": "Overhead (ms)",
+        #     "title": "Framework Overhead (Lower is Better)",
+        #     "palette": "PuBuGn",
+        # },
         {
             "column": "average_tool_ms",
             "ylabel": "Tool Exec (ms)",
@@ -186,7 +188,11 @@ def plot_metrics_grid(frame: pd.DataFrame, output_dir: Path, output_path: Path |
         fontsize=12,
     )
     fig.tight_layout(rect=(0, 0, 1, 0.95))
-    save_path = output_path if output_path is not None else output_dir / f"benchmark_grid_{total_requests}.png"
+    save_path = (
+        output_path
+        if output_path is not None
+        else output_dir / f"benchmark_grid_{total_requests}.png"
+    )
     fig.savefig(save_path, dpi=300)
     plt.close(fig)
 

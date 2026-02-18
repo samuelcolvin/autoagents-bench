@@ -8,21 +8,27 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import List, Optional
 
-from langchain.agents import AgentType, initialize_agent
+import yaml
+from langchain.agents import AgentExecutor, create_tool_calling_agent
 from langchain.tools import Tool
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
-import yaml
 
 from .metrics import PerformanceMonitor
-from .timing import LlmTimingRecorder, TimingRecorder, llm_request_id, patch_openai_timing, unpatch_openai_timing
+from .timing import (
+    LlmTimingRecorder,
+    TimingRecorder,
+    llm_request_id,
+    patch_openai_timing,
+    unpatch_openai_timing,
+)
 from .trip_tool import (
     TripDataEmptyError,
     TripDataNotFoundError,
     compute_average_trip_duration_minutes,
     format_average_trip_duration,
 )
-
 
 SUCCESS_ABS_TOLERANCE: float = 0.01
 _TOOL_TIMINGS = TimingRecorder()
@@ -165,7 +171,7 @@ def expected_value() -> float:
 def build_llm_only_prompt(request_id: int, expected: float) -> str:
     return (
         f"Request {request_id}. The average trip duration in minutes is {expected:.2f}. "
-        f"Return JSON only in the format {{\"value\": {expected:.2f}}}."
+        f'Return JSON only in the format {{"value": {expected:.2f}}}.'
     )
 
 
@@ -193,10 +199,14 @@ def extract_value(text: str) -> Optional[float]:
     return None
 
 
-def apply_overhead_metrics(tool_result: BenchmarkResult, llm_result: BenchmarkResult) -> None:
+def apply_overhead_metrics(
+    tool_result: BenchmarkResult, llm_result: BenchmarkResult
+) -> None:
     tool_result.average_framework_overhead_ms = max(
         0.0,
-        tool_result.average_call_ms - llm_result.average_call_ms - tool_result.average_tool_ms,
+        tool_result.average_call_ms
+        - llm_result.average_call_ms
+        - tool_result.average_tool_ms,
     )
     tool_result.p95_framework_overhead_ms = max(
         0.0,
@@ -204,11 +214,15 @@ def apply_overhead_metrics(tool_result: BenchmarkResult, llm_result: BenchmarkRe
     )
     tool_result.average_framework_overhead_corrected_ms = max(
         0.0,
-        tool_result.average_call_ms - tool_result.average_llm_total_ms - tool_result.average_tool_ms,
+        tool_result.average_call_ms
+        - tool_result.average_llm_total_ms
+        - tool_result.average_tool_ms,
     )
     tool_result.p95_framework_overhead_corrected_ms = max(
         0.0,
-        tool_result.p95_call_ms - tool_result.p95_llm_total_ms - tool_result.p95_tool_ms,
+        tool_result.p95_call_ms
+        - tool_result.p95_llm_total_ms
+        - tool_result.p95_tool_ms,
     )
 
 
@@ -229,7 +243,7 @@ async def run_langchain_benchmark(
         f"Preparing LangChain benchmark ({mode}): {config.total_requests} requests with concurrency {config.concurrency}"
     )
 
-    llm = ChatOpenAI(model=config.model, temperature=0.2)
+    llm = ChatOpenAI(model=config.model)
     structured_llm = llm.with_structured_output(FloatResponse)
 
     if mode == "tool":
@@ -238,15 +252,16 @@ async def run_langchain_benchmark(
             name="trip_data_average_duration",
             description="Compute the average trip duration in minutes from the TLC dataset.",
         )
-        agent = initialize_agent(
-            tools=[tool],
-            llm=llm,
-            agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
-            verbose=False,
-        )
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", "You are a helpful assistant."),
+            ("human", "{input}"),
+            ("placeholder", "{agent_scratchpad}"),
+        ])
+        agent = create_tool_calling_agent(llm=llm, tools=[tool], prompt=prompt)
+        agent_executor = AgentExecutor(agent=agent, tools=[tool], verbose=False)
 
         async def run_call(prompt: str) -> Optional[float]:
-            result = await agent.ainvoke({"input": prompt})
+            result = await agent_executor.ainvoke({"input": prompt})
             output = result.get("output") if isinstance(result, dict) else str(result)
             return extract_value(output)
 
@@ -268,7 +283,7 @@ async def run_langchain_benchmark(
         if mode == "tool":
             prompt = (
                 f"{config.prompt_template.format(i=request_id)}\n"
-                "Return JSON only in the format {\"value\": <number>}."
+                'Return JSON only in the format {"value": <number>}.'
             )
         else:
             prompt = build_llm_only_prompt(request_id, expected)
@@ -321,15 +336,17 @@ async def run_langchain_benchmark(
     determinism_rate = success_count / max(1, len(breakdowns))
     tool_durations = sorted(_TOOL_TIMINGS.snapshot()) if mode == "tool" else []
     tool_divisor = len(tool_durations) or 1
-    avg_tool_ms = (sum(tool_durations) / tool_divisor) * 1_000.0 if tool_durations else 0.0
-    p95_tool_ms = (
-        percentile(tool_durations, 0.95) * 1_000.0 if tool_durations else 0.0
+    avg_tool_ms = (
+        (sum(tool_durations) / tool_divisor) * 1_000.0 if tool_durations else 0.0
     )
+    p95_tool_ms = percentile(tool_durations, 0.95) * 1_000.0 if tool_durations else 0.0
 
     if mode == "tool":
         llm_totals = sorted(_LLM_TIMINGS.snapshot_request_totals())
         llm_divisor = len(llm_totals) or 1
-        avg_llm_total_ms = (sum(llm_totals) / llm_divisor) * 1_000.0 if llm_totals else 0.0
+        avg_llm_total_ms = (
+            (sum(llm_totals) / llm_divisor) * 1_000.0 if llm_totals else 0.0
+        )
         p95_llm_total_ms = percentile(llm_totals, 0.95) * 1_000.0 if llm_totals else 0.0
     else:
         avg_llm_total_ms = avg_call_ms
