@@ -5,16 +5,15 @@ import os
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import List, TypedDict
+from typing import List
 
-from langchain_openai import ChatOpenAI
-from pydantic import BaseModel, Field
-
-from langchain_core.tools import tool
-from langgraph.prebuilt import create_react_agent
-from langgraph.graph import END, StateGraph
 import yaml
+from pydantic import BaseModel, Field
+from pydantic_ai import Agent, RunContext
+from pydantic_ai.models.openai import OpenAIChatModel, OpenAIModel
+from pydantic_ai.settings import ModelSettings
 
+from .metrics import PerformanceMonitor
 from .timing import LlmTimingRecorder, TimingRecorder, llm_request_id, patch_openai_timing, unpatch_openai_timing
 from .trip_tool import (
     TripDataEmptyError,
@@ -22,8 +21,6 @@ from .trip_tool import (
     compute_average_trip_duration_minutes,
     format_average_trip_duration,
 )
-from .metrics import PerformanceMonitor
-
 
 SUCCESS_ABS_TOLERANCE: float = 0.01
 _TOOL_TIMINGS = TimingRecorder()
@@ -137,20 +134,8 @@ def persist_result(result: BenchmarkResult, output_path: Path) -> None:
     output_path.write_text(json.dumps(data, indent=2, sort_keys=True))
 
 
-@tool("trip_data_average_duration", return_direct=False)
-def trip_data_average_duration_tool() -> str:
-    """Summarise the average TLC trip duration from the parquet dataset."""
-    started = time.perf_counter()
-    try:
-        return format_average_trip_duration()
-    except (TripDataNotFoundError, TripDataEmptyError) as exc:
-        return (
-            f"Unable to compute trip duration: {exc}"  # Agent can relay precise issue.
-        )
-    except Exception as exc:  # pragma: no cover - defensive guard
-        return f"Unexpected error while computing trip duration: {exc}"
-    finally:
-        _TOOL_TIMINGS.record(time.perf_counter() - started)
+class FloatResponse(BaseModel):
+    value: float = Field(description="The numerical result as a float")
 
 
 def percentile(data: List[float], perc: float) -> float:
@@ -169,7 +154,7 @@ def expected_value() -> float:
 def build_llm_only_prompt(request_id: int, expected: float) -> str:
     return (
         f"Request {request_id}. The average trip duration in minutes is {expected:.2f}. "
-        f"Return JSON only in the format {{\"answer\": {expected:.2f}}}."
+        f'Return JSON only in the format {{"value": {expected:.2f}}}.'
     )
 
 
@@ -177,10 +162,14 @@ def is_successful_result(value: float, expected: float) -> bool:
     return math.isclose(value, expected, abs_tol=SUCCESS_ABS_TOLERANCE)
 
 
-def apply_overhead_metrics(tool_result: BenchmarkResult, llm_result: BenchmarkResult) -> None:
+def apply_overhead_metrics(
+    tool_result: BenchmarkResult, llm_result: BenchmarkResult
+) -> None:
     tool_result.average_framework_overhead_ms = max(
         0.0,
-        tool_result.average_call_ms - llm_result.average_call_ms - tool_result.average_tool_ms,
+        tool_result.average_call_ms
+        - llm_result.average_call_ms
+        - tool_result.average_tool_ms,
     )
     tool_result.p95_framework_overhead_ms = max(
         0.0,
@@ -196,25 +185,34 @@ def apply_overhead_metrics(tool_result: BenchmarkResult, llm_result: BenchmarkRe
     )
 
 
-# 1. Define your structured output schema
-class TripDurationResult(BaseModel):
-    average_trip_duration_minutes: float = Field(
-        ..., description="Average trip duration in minutes"
+def build_agent(model: OpenAIChatModel, with_tools: bool) -> Agent:
+    settings = ModelSettings(temperature=0.2)
+    agent = Agent(
+        model=model,
+        output_type=FloatResponse,
+        system_prompt="You are a helpful assistant. Use tools when available.",
+        model_settings=settings,
     )
-    row_count: int = Field(..., description="Number of trips in dataset")
+
+    if with_tools:
+
+        @agent.tool
+        def trip_data_average_duration(_: RunContext) -> str:
+            """Compute the average TLC trip duration in minutes from the dataset."""
+            started = time.perf_counter()
+            try:
+                return format_average_trip_duration()
+            except (TripDataNotFoundError, TripDataEmptyError) as exc:
+                return f"Unable to compute trip duration: {exc}"
+            except Exception as exc:  # pragma: no cover - defensive guard
+                return f"Unexpected error while computing trip duration: {exc}"
+            finally:
+                _TOOL_TIMINGS.record(time.perf_counter() - started)
+
+    return agent
 
 
-class StructuredResponseSchema(BaseModel):
-    """Always use this tool to structure your response to the user."""
-
-    answer: float = Field(description="The Average Trip Duration in Minutes")
-
-class LlmOnlyState(TypedDict):
-    prompt: str
-    structured_response: StructuredResponseSchema
-
-
-async def run_langgraph_benchmark(
+async def run_pydantic_ai_benchmark(
     config: BenchmarkConfig, mode: str, expected: float
 ) -> BenchmarkResult:
     setup_start = time.perf_counter()
@@ -228,46 +226,16 @@ async def run_langgraph_benchmark(
         patch_openai_timing(_LLM_TIMINGS)
 
     print(
-        f"Preparing LangGraph benchmark ({mode}): {config.total_requests} requests with concurrency {config.concurrency}"
+        f"Preparing PydanticAI benchmark ({mode}): {config.total_requests} requests with concurrency {config.concurrency}"
     )
 
-    llm = ChatOpenAI(model=config.model)
-
-    if mode == "tool":
-        agent = create_react_agent(
-            llm,
-            prompt="You are helpful assistant, Provide the answer to the user's question in structured format",
-            tools=[trip_data_average_duration_tool],
-            response_format=StructuredResponseSchema,
-        )
-
-        async def run_call(prompt: str) -> StructuredResponseSchema:
-            result = await agent.ainvoke({"messages": [("user", prompt)]})
-            return result["structured_response"]
-
-    elif mode == "llm":
-        structured_llm = llm.with_structured_output(StructuredResponseSchema)
-
-        graph = StateGraph(LlmOnlyState)
-
-        async def model_node(state: LlmOnlyState) -> LlmOnlyState:
-            response = await structured_llm.ainvoke(state["prompt"])
-            return {"prompt": state["prompt"], "structured_response": response}
-
-        graph.add_node("model", model_node)
-        graph.set_entry_point("model")
-        graph.add_edge("model", END)
-        compiled = graph.compile()
-
-        async def run_call(prompt: str) -> StructuredResponseSchema:
-            result = await compiled.ainvoke({"prompt": prompt})
-            return result["structured_response"]
-
-    else:
-        raise ValueError(f"Unsupported mode: {mode}")
+    model = OpenAIModel(model_name=config.model)
+    agent = build_agent(model, with_tools=mode == "tool")
 
     breakdowns: List[TimingBreakdown] = []
     sem = asyncio.Semaphore(config.concurrency)
+    monitor = PerformanceMonitor()
+    monitor.start()
 
     async def worker(request_id: int) -> None:
         prompt = (
@@ -282,10 +250,10 @@ async def run_langgraph_benchmark(
             call_started = time.perf_counter()
             llm_request_id.set(request_id)
             try:
-                response = await run_call(prompt)
-                value = float(response.answer)
+                result = await agent.run(prompt)
+                value = float(result.output.value)
                 status = is_successful_result(value, expected)
-            except (KeyError, TypeError, ValueError):
+            except Exception:
                 status = False
             call_duration = time.perf_counter() - call_started
             total_duration = time.perf_counter() - submitted
@@ -299,9 +267,7 @@ async def run_langgraph_benchmark(
             )
         )
 
-    monitor = PerformanceMonitor()
     cold_start_ms = (time.perf_counter() - setup_start) * 1_000.0
-    monitor.start()
     overall_started = time.perf_counter()
     tasks = [asyncio.create_task(worker(i)) for i in range(config.total_requests)]
     await asyncio.gather(*tasks)
@@ -328,10 +294,10 @@ async def run_langgraph_benchmark(
     determinism_rate = success_count / max(1, len(breakdowns))
     tool_durations = sorted(_TOOL_TIMINGS.snapshot()) if mode == "tool" else []
     tool_divisor = len(tool_durations) or 1
-    avg_tool_ms = (sum(tool_durations) / tool_divisor) * 1_000.0 if tool_durations else 0.0
-    p95_tool_ms = (
-        percentile(tool_durations, 0.95) * 1_000.0 if tool_durations else 0.0
+    avg_tool_ms = (
+        (sum(tool_durations) / tool_divisor) * 1_000.0 if tool_durations else 0.0
     )
+    p95_tool_ms = percentile(tool_durations, 0.95) * 1_000.0 if tool_durations else 0.0
 
     if mode == "tool":
         llm_totals = sorted(_LLM_TIMINGS.snapshot_request_totals())
@@ -343,7 +309,7 @@ async def run_langgraph_benchmark(
         p95_llm_total_ms = percentile(call_latencies, 0.95) * 1_000.0
 
     return BenchmarkResult(
-        name="LangGraph",
+        name="PydanticAI",
         total_requests=len(breakdowns),
         concurrency=config.concurrency,
         total_duration=total_duration,
@@ -392,7 +358,7 @@ def load_config() -> BenchmarkConfig:
         prompt_template = str(
             data.get(
                 "prompt_template",
-                "Calculate the average trip duration in minutes using the provided tools.",
+                "Calculate the average trip duration in minutes using the available tool.",
             )
         )
     except KeyError as exc:
@@ -406,17 +372,19 @@ def load_config() -> BenchmarkConfig:
     )
 
 
-async def run_langgraph() -> None:
+async def run_pydantic_ai() -> None:
     config = load_config()
     expected = expected_value()
 
-    llm_result = await run_langgraph_benchmark(config, mode="llm", expected=expected)
-    print("\n=== LangGraph LLM Results ===")
+    llm_result = await run_pydantic_ai_benchmark(config, mode="llm", expected=expected)
+    print("\n=== PydanticAI LLM Results ===")
     llm_result.print()
     persist_result(llm_result, Path("benchmark_results_llm.json"))
 
-    tool_result = await run_langgraph_benchmark(config, mode="tool", expected=expected)
+    tool_result = await run_pydantic_ai_benchmark(
+        config, mode="tool", expected=expected
+    )
     apply_overhead_metrics(tool_result, llm_result)
-    print("\n=== LangGraph Tool Results ===")
+    print("\n=== PydanticAI Tool Results ===")
     tool_result.print()
     persist_result(tool_result, Path("benchmark_results_tool.json"))

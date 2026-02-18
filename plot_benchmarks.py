@@ -77,7 +77,11 @@ def load_results(path: Path) -> pd.DataFrame:
     return frame
 
 
-def plot_metrics_grid(frame: pd.DataFrame, output_dir: Path) -> None:
+def plot_metrics_grid(frame: pd.DataFrame, output_dir: Path, output_path: Path | None = None) -> None:
+    if "determinism_rate" in frame.columns:
+        frame = frame.copy()
+        frame["determinism_percent"] = frame["determinism_rate"] * 100.0
+
     metrics = [
         {
             "column": "throughput_rps",
@@ -103,7 +107,53 @@ def plot_metrics_grid(frame: pd.DataFrame, output_dir: Path) -> None:
             "title": "P95 Latency (Lower is Better)",
             "palette": "Purples_d",
         },
+        {
+            "column": "average_framework_overhead_ms",
+            "ylabel": "Overhead (ms)",
+            "title": "Framework Overhead (Lower is Better)",
+            "palette": "PuBuGn",
+        },
+        {
+            "column": "average_tool_ms",
+            "ylabel": "Tool Exec (ms)",
+            "title": "Tool Execution (Lower is Better)",
+            "palette": "BuGn",
+        },
+        {
+            "column": "cpu_usage_percent",
+            "ylabel": "CPU Usage (%)",
+            "title": "CPU Usage (Lower is Better)",
+            "palette": "Reds_d",
+        },
+        {
+            "column": "memory_peak_mb",
+            "ylabel": "Peak Memory (MB)",
+            "title": "Peak Memory (Lower is Better)",
+            "palette": "Greys",
+        },
+        {
+            "column": "p99_latency_ms",
+            "ylabel": "Latency (ms)",
+            "title": "P99 Latency (Lower is Better)",
+            "palette": "RdPu",
+        },
+        {
+            "column": "cold_start_ms",
+            "ylabel": "Time (ms)",
+            "title": "Cold Start Time (Lower is Better)",
+            "palette": "YlOrRd",
+        },
+        {
+            "column": "determinism_percent",
+            "ylabel": "Determinism (%)",
+            "title": "Determinism (Higher is Better)",
+            "palette": "YlGn",
+        },
     ]
+
+    metrics = [metric for metric in metrics if metric["column"] in frame.columns]
+    if not metrics:
+        raise ValueError("No known metrics found in the benchmark results.")
 
     cols = 2
     rows = (len(metrics) + cols - 1) // cols
@@ -136,7 +186,8 @@ def plot_metrics_grid(frame: pd.DataFrame, output_dir: Path) -> None:
         fontsize=12,
     )
     fig.tight_layout(rect=(0, 0, 1, 0.95))
-    fig.savefig(output_dir / f"benchmark_grid_{total_requests}.png", dpi=300)
+    save_path = output_path if output_path is not None else output_dir / f"benchmark_grid_{total_requests}.png"
+    fig.savefig(save_path, dpi=300)
     plt.close(fig)
 
 
@@ -154,6 +205,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("plots"),
         help="Directory where PNG files will be written",
     )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Full output file path for the PNG (overrides --output-dir and auto-naming)",
+    )
     return parser
 
 
@@ -169,7 +226,7 @@ def main() -> None:
     frame = load_results(args.input)
     frame = frame.sort_values("throughput_rps", ascending=False)
 
-    plot_metrics_grid(frame, output_dir)
+    plot_metrics_grid(frame, output_dir, output_path=args.output)
 
 
 if __name__ == "__main__":

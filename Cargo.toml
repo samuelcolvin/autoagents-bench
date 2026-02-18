@@ -18,3 +18,5 @@ thiserror = "2.0.16"
 tokio = { version = "1.47.1", features = ["full"] }
 chrono = { version = "0.4.38", default-features = false, features = ["std"] }
 polars = {version = "0.51.0", features = ["parquet", "dtype-datetime", "lazy"] }
+libc = "0.2.170"
+rig-core = { version = "0.31", features = ["derive"] }

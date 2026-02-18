@@ -5,7 +5,6 @@ import os
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from tokenize import Floatnumber
 from typing import List
 from crewai import Agent, Task, Crew
 
@@ -16,11 +15,15 @@ from langchain_openai import ChatOpenAI
 from .trip_tool import (
     TripDataEmptyError,
     TripDataNotFoundError,
+    compute_average_trip_duration_minutes,
     format_average_trip_duration,
 )
+from .metrics import PerformanceMonitor
+from .timing import LlmTimingRecorder, TimingRecorder, llm_request_id, patch_openai_timing, unpatch_openai_timing
 
-FINAL_AGGREGATION_RESPONSE: float = 25.7
 SUCCESS_ABS_TOLERANCE: float = 0.01
+_TOOL_TIMINGS = TimingRecorder()
+_LLM_TIMINGS = LlmTimingRecorder()
 
 
 @dataclass
@@ -54,17 +57,32 @@ class BenchmarkResult:
     p95_call_ms: float
     average_processing_ms: float
     p95_processing_ms: float
+    average_tool_ms: float
+    p95_tool_ms: float
+    average_framework_overhead_ms: float
+    p95_framework_overhead_ms: float
+    average_llm_total_ms: float
+    p95_llm_total_ms: float
+    average_framework_overhead_corrected_ms: float
+    p95_framework_overhead_corrected_ms: float
     total_success: int
     total_failure: int
+    cpu_usage_percent: float
+    memory_peak_mb: float
+    p99_latency_ms: float
+    cold_start_ms: float
+    determinism_rate: float
 
     def print(self) -> None:
         print(f"--- {self.name} ---")
         print(f"requests      : {self.total_requests}")
         print(f"concurrency   : {self.concurrency}")
+        print(f"cold start    : {self.cold_start_ms:.2f} ms")
         print(f"total time    : {self.total_duration:.3f} s")
         print(f"throughput    : {self.throughput_rps:.2f} req/s")
         print(f"avg latency   : {self.average_latency_ms:.2f} ms")
         print(f"p95 latency   : {self.p95_latency_ms:.2f} ms")
+        print(f"p99 latency   : {self.p99_latency_ms:.2f} ms")
         print(
             f"queue wait    : avg {self.average_queue_ms:.2f} ms | p95 {self.p95_queue_ms:.2f} ms"
         )
@@ -74,12 +92,31 @@ class BenchmarkResult:
         print(
             f"framework ovh : avg {self.average_processing_ms:.2f} ms | p95 {self.p95_processing_ms:.2f} ms"
         )
+        print(
+            f"tool exec     : avg {self.average_tool_ms:.2f} ms | p95 {self.p95_tool_ms:.2f} ms"
+        )
+        print(
+            "framework ovh : avg {:.2f} ms | p95 {:.2f} ms (tool+llm subtracted)".format(
+                self.average_framework_overhead_ms, self.p95_framework_overhead_ms
+            )
+        )
+        print(
+            f"llm total     : avg {self.average_llm_total_ms:.2f} ms | p95 {self.p95_llm_total_ms:.2f} ms"
+        )
+        print(
+            "framework ovh : avg {:.2f} ms | p95 {:.2f} ms (corrected)".format(
+                self.average_framework_overhead_corrected_ms,
+                self.p95_framework_overhead_corrected_ms,
+            )
+        )
+        print(f"cpu usage    : {self.cpu_usage_percent:.2f} %")
+        print(f"peak memory  : {self.memory_peak_mb:.2f} MB")
+        print(f"determinism  : {self.determinism_rate * 100.0:.2f} %")
         print(f"success count  : {self.total_success}")
         print(f"failure count  : {self.total_failure}")
 
 
-def persist_result(result: BenchmarkResult) -> None:
-    output_path = Path(os.getenv("BENCH_RESULTS_PATH", "benchmark_results.json"))
+def persist_result(result: BenchmarkResult, output_path: Path) -> None:
     payload = asdict(result)
     payload["total_duration"] = float(payload.get("total_duration", 0.0))
 
@@ -101,12 +138,15 @@ class TripDataAverageDurationTool(BaseTool):
     description: str = "Compute the average TLC trip duration in minutes from the trip_data.parquet dataset."
 
     def _run(self, *_, **__) -> str:
+        started = time.perf_counter()
         try:
             return format_average_trip_duration()
         except (TripDataNotFoundError, TripDataEmptyError) as exc:
             return f"Unable to compute trip duration: {exc}"
         except Exception as exc:  # pragma: no cover - defensive guard
             return f"Unexpected error while computing trip duration: {exc}"
+        finally:
+            _TOOL_TIMINGS.record(time.perf_counter() - started)
 
     async def _arun(
         self, *args, **kwargs
@@ -122,8 +162,39 @@ def percentile(data: List[float], perc: float) -> float:
     return data[rank]
 
 
-def is_successful_result(value: float) -> bool:
-    return math.isclose(value, FINAL_AGGREGATION_RESPONSE, abs_tol=SUCCESS_ABS_TOLERANCE)
+def expected_value() -> float:
+    aggregate = compute_average_trip_duration_minutes()
+    return round(float(aggregate.average_minutes), 2)
+
+
+def build_llm_only_prompt(request_id: int, expected: float) -> str:
+    return (
+        f"Request {request_id}. The average trip duration in minutes is {expected:.2f}. "
+        f"Return JSON only in the format {{\"value\": {expected:.2f}}}."
+    )
+
+
+def is_successful_result(value: float, expected: float) -> bool:
+    return math.isclose(value, expected, abs_tol=SUCCESS_ABS_TOLERANCE)
+
+
+def apply_overhead_metrics(tool_result: BenchmarkResult, llm_result: BenchmarkResult) -> None:
+    tool_result.average_framework_overhead_ms = max(
+        0.0,
+        tool_result.average_call_ms - llm_result.average_call_ms - tool_result.average_tool_ms,
+    )
+    tool_result.p95_framework_overhead_ms = max(
+        0.0,
+        tool_result.p95_call_ms - llm_result.p95_call_ms - tool_result.p95_tool_ms,
+    )
+    tool_result.average_framework_overhead_corrected_ms = max(
+        0.0,
+        tool_result.average_call_ms - tool_result.average_llm_total_ms - tool_result.average_tool_ms,
+    )
+    tool_result.p95_framework_overhead_corrected_ms = max(
+        0.0,
+        tool_result.p95_call_ms - tool_result.p95_llm_total_ms - tool_result.p95_tool_ms,
+    )
 
 
 def load_config() -> BenchmarkConfig:
@@ -165,7 +236,7 @@ class FloatResponse(BaseModel):
     value: float = Field(description="The numerical result as a float")
 
 
-def build_agent(model: str, tool: BaseTool) -> Agent:
+def build_agent(model: str, tools: List[BaseTool]) -> Agent:
     llm = ChatOpenAI(model=model, temperature=0.2)
     return Agent(
         role="Python Data Analyst",
@@ -179,52 +250,73 @@ def build_agent(model: str, tool: BaseTool) -> Agent:
         llm=llm,
         max_iter=3,
         verbose=False,
-        tools=[tool],
+        tools=tools,
     )
 
 
-async def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
+async def run_benchmark(config: BenchmarkConfig, mode: str, expected: float) -> BenchmarkResult:
+    setup_start = time.perf_counter()
     if config.concurrency < 1:
         raise ValueError("concurrency must be greater than zero")
     if config.total_requests < 1:
         raise ValueError("total_requests must be greater than zero")
+    if mode == "tool":
+        _TOOL_TIMINGS.reset()
+        _LLM_TIMINGS.reset()
+        patch_openai_timing(_LLM_TIMINGS)
 
     print(
-        f"Preparing CrewAI benchmark: {config.total_requests} requests with concurrency {config.concurrency}"
+        f"Preparing CrewAI benchmark ({mode}): {config.total_requests} requests with concurrency {config.concurrency}"
     )
 
+    # Build one LLM client during setup so cold_start captures initialization
+    # cost comparable to other frameworks (CrewAI recreates agents per-request)
+    ChatOpenAI(model=config.model, temperature=0.2)
+
     breakdowns: List[TimingBreakdown] = []
+    sem = asyncio.Semaphore(config.concurrency)
 
     async def worker(request_id: int) -> None:
-        prompt = config.prompt_template.format(i=request_id)
+        prompt = (
+            config.prompt_template.format(i=request_id)
+            if mode == "tool"
+            else build_llm_only_prompt(request_id, expected)
+        )
         submitted = time.perf_counter()
-        dequeued = time.perf_counter()
-        queue_wait = dequeued - submitted
-        call_started = time.perf_counter()
+        async with sem:
+            dequeued = time.perf_counter()
+            queue_wait = dequeued - submitted
+            call_started = time.perf_counter()
+            llm_request_id.set(request_id)
 
-        def kickoff() -> bool:
-            tool = TripDataAverageDurationTool()
-            agent = build_agent(config.model, tool)
-            task = Task(
-                description=(
-                    f"{prompt}\nUse the provided trip data tool or Python code execution "
-                    "to compute the average trip duration in minutes."
-                ),
-                agent=agent,
-                output_json=FloatResponse,
-                expected_output="Average trip duration summary in minutes.",
-            )
-            crew = Crew(agents=[agent], tasks=[task])
-            result = crew.kickoff()
-            try:
-                value = float(result["value"])
-            except (KeyError, TypeError, ValueError):
-                return False
-            return is_successful_result(value)
+            def kickoff() -> bool:
+                tools: List[BaseTool] = []
+                if mode == "tool":
+                    tools = [TripDataAverageDurationTool()]
+                agent = build_agent(config.model, tools)
+                task = Task(
+                    description=(
+                        f"{prompt}\nUse the provided trip data tool or Python code execution "
+                        "to compute the average trip duration in minutes."
+                        if mode == "tool"
+                        else f"{prompt}\nReturn JSON with the average value only."
+                    ),
+                    agent=agent,
+                    output_json=FloatResponse,
+                    expected_output="Average trip duration summary in minutes.",
+                )
+                crew = Crew(agents=[agent], tasks=[task])
+                result = crew.kickoff()
+                try:
+                    value = float(result["value"])
+                except (KeyError, TypeError, ValueError):
+                    return False
+                return is_successful_result(value, expected)
 
-        status = await asyncio.to_thread(kickoff)
-        call_duration = time.perf_counter() - call_started
-        total_duration = time.perf_counter() - submitted
+            status = await asyncio.to_thread(kickoff)
+            call_duration = time.perf_counter() - call_started
+            total_duration = time.perf_counter() - submitted
+
         breakdowns.append(
             TimingBreakdown(
                 total=total_duration,
@@ -234,10 +326,17 @@ async def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
             )
         )
 
+    monitor = PerformanceMonitor()
+    cold_start_ms = (time.perf_counter() - setup_start) * 1_000.0
+    monitor.start()
     overall_started = time.perf_counter()
     tasks = [asyncio.create_task(worker(i)) for i in range(config.total_requests)]
     await asyncio.gather(*tasks)
     total_duration = time.perf_counter() - overall_started
+    perf = monitor.stop()
+
+    if mode == "tool":
+        unpatch_openai_timing()
 
     totals = sorted(b.total for b in breakdowns)
     queue_waits = sorted(b.queue_wait for b in breakdowns)
@@ -254,6 +353,22 @@ async def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
 
     success_count = sum(1 for b in breakdowns if b.status)
     failure_count = len(breakdowns) - success_count
+    determinism_rate = success_count / max(1, len(breakdowns))
+    tool_durations = sorted(_TOOL_TIMINGS.snapshot()) if mode == "tool" else []
+    tool_divisor = len(tool_durations) or 1
+    avg_tool_ms = (sum(tool_durations) / tool_divisor) * 1_000.0 if tool_durations else 0.0
+    p95_tool_ms = (
+        percentile(tool_durations, 0.95) * 1_000.0 if tool_durations else 0.0
+    )
+
+    if mode == "tool":
+        llm_totals = sorted(_LLM_TIMINGS.snapshot_request_totals())
+        llm_divisor = len(llm_totals) or 1
+        avg_llm_total_ms = (sum(llm_totals) / llm_divisor) * 1_000.0 if llm_totals else 0.0
+        p95_llm_total_ms = percentile(llm_totals, 0.95) * 1_000.0 if llm_totals else 0.0
+    else:
+        avg_llm_total_ms = avg_call_ms
+        p95_llm_total_ms = percentile(call_latencies, 0.95) * 1_000.0
 
     return BenchmarkResult(
         name="CrewAI",
@@ -263,21 +378,41 @@ async def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
         throughput_rps=throughput_rps,
         average_latency_ms=avg_latency_ms,
         p95_latency_ms=percentile(totals, 0.95) * 1_000.0,
+        p99_latency_ms=percentile(totals, 0.99) * 1_000.0,
+        cold_start_ms=cold_start_ms,
         average_queue_ms=avg_queue_ms,
         p95_queue_ms=percentile(queue_waits, 0.95) * 1_000.0,
         average_call_ms=avg_call_ms,
         p95_call_ms=percentile(call_latencies, 0.95) * 1_000.0,
         average_processing_ms=avg_processing_ms,
         p95_processing_ms=percentile(processing_latencies, 0.95) * 1_000.0,
+        average_tool_ms=avg_tool_ms,
+        p95_tool_ms=p95_tool_ms,
+        average_framework_overhead_ms=0.0,
+        p95_framework_overhead_ms=0.0,
+        average_llm_total_ms=avg_llm_total_ms,
+        p95_llm_total_ms=p95_llm_total_ms,
+        average_framework_overhead_corrected_ms=0.0,
+        p95_framework_overhead_corrected_ms=0.0,
         total_success=success_count,
         total_failure=failure_count,
+        cpu_usage_percent=perf.cpu_usage_percent,
+        memory_peak_mb=perf.memory_peak_mb,
+        determinism_rate=determinism_rate,
     )
 
 
 async def run_crewai() -> None:
     config = load_config()
-    result = await run_benchmark(config)
+    expected = expected_value()
 
-    print("\n=== CrewAI Results ===")
-    result.print()
-    persist_result(result)
+    llm_result = await run_benchmark(config, mode="llm", expected=expected)
+    print("\n=== CrewAI LLM Results ===")
+    llm_result.print()
+    persist_result(llm_result, Path("benchmark_results_llm.json"))
+
+    tool_result = await run_benchmark(config, mode="tool", expected=expected)
+    apply_overhead_metrics(tool_result, llm_result)
+    print("\n=== CrewAI Tool Results ===")
+    tool_result.print()
+    persist_result(tool_result, Path("benchmark_results_tool.json"))
