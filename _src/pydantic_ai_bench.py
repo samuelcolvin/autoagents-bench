@@ -5,16 +5,23 @@ import os
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import List
+from typing import Annotated, List
 
 import yaml
-from pydantic import BaseModel, Field
-from pydantic_ai import Agent, RunContext
-from pydantic_ai.models.openai import OpenAIChatModel, OpenAIModel
+from pydantic import Field
+from pydantic_ai import Agent
+from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.settings import ModelSettings
+from typing_extensions import TypedDict
 
 from .metrics import PerformanceMonitor
-from .timing import LlmTimingRecorder, TimingRecorder, llm_request_id, patch_openai_timing, unpatch_openai_timing
+from .timing import (
+    LlmTimingRecorder,
+    TimingRecorder,
+    llm_request_id,
+    patch_openai_timing,
+    unpatch_openai_timing,
+)
 from .trip_tool import (
     TripDataEmptyError,
     TripDataNotFoundError,
@@ -134,8 +141,8 @@ def persist_result(result: BenchmarkResult, output_path: Path) -> None:
     output_path.write_text(json.dumps(data, indent=2, sort_keys=True))
 
 
-class FloatResponse(BaseModel):
-    value: float = Field(description="The numerical result as a float")
+class FloatResponse(TypedDict):
+    value: Annotated[float, Field(description="The numerical result as a float")]
 
 
 def percentile(data: List[float], perc: float) -> float:
@@ -177,15 +184,19 @@ def apply_overhead_metrics(
     )
     tool_result.average_framework_overhead_corrected_ms = max(
         0.0,
-        tool_result.average_call_ms - tool_result.average_llm_total_ms - tool_result.average_tool_ms,
+        tool_result.average_call_ms
+        - tool_result.average_llm_total_ms
+        - tool_result.average_tool_ms,
     )
     tool_result.p95_framework_overhead_corrected_ms = max(
         0.0,
-        tool_result.p95_call_ms - tool_result.p95_llm_total_ms - tool_result.p95_tool_ms,
+        tool_result.p95_call_ms
+        - tool_result.p95_llm_total_ms
+        - tool_result.p95_tool_ms,
     )
 
 
-def build_agent(model: OpenAIChatModel, with_tools: bool) -> Agent:
+def build_agent(model: OpenAIChatModel, with_tools: bool) -> Agent[None, FloatResponse]:
     settings = ModelSettings(temperature=0.2)
     agent = Agent(
         model=model,
@@ -196,8 +207,8 @@ def build_agent(model: OpenAIChatModel, with_tools: bool) -> Agent:
 
     if with_tools:
 
-        @agent.tool
-        def trip_data_average_duration(_: RunContext) -> str:
+        @agent.tool_plain
+        def trip_data_average_duration() -> str:
             """Compute the average TLC trip duration in minutes from the dataset."""
             started = time.perf_counter()
             try:
@@ -229,7 +240,7 @@ async def run_pydantic_ai_benchmark(
         f"Preparing PydanticAI benchmark ({mode}): {config.total_requests} requests with concurrency {config.concurrency}"
     )
 
-    model = OpenAIModel(model_name=config.model)
+    model = OpenAIChatModel(model_name=config.model)
     agent = build_agent(model, with_tools=mode == "tool")
 
     breakdowns: List[TimingBreakdown] = []
@@ -251,7 +262,7 @@ async def run_pydantic_ai_benchmark(
             llm_request_id.set(request_id)
             try:
                 result = await agent.run(prompt)
-                value = float(result.output.value)
+                value = float(result.output["value"])
                 status = is_successful_result(value, expected)
             except Exception:
                 status = False
@@ -302,7 +313,9 @@ async def run_pydantic_ai_benchmark(
     if mode == "tool":
         llm_totals = sorted(_LLM_TIMINGS.snapshot_request_totals())
         llm_divisor = len(llm_totals) or 1
-        avg_llm_total_ms = (sum(llm_totals) / llm_divisor) * 1_000.0 if llm_totals else 0.0
+        avg_llm_total_ms = (
+            (sum(llm_totals) / llm_divisor) * 1_000.0 if llm_totals else 0.0
+        )
         p95_llm_total_ms = percentile(llm_totals, 0.95) * 1_000.0 if llm_totals else 0.0
     else:
         avg_llm_total_ms = avg_call_ms
